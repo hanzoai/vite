@@ -125,11 +125,16 @@ describe.runIf(isServe)('serve', () => {
     },
   )
 
-  // bundled dev: plain postcss css gets an empty inline map (no sources) —
-  // a real gap, nothing to assert yet (vitejs/vite#23028)
+  // bundled dev: plain postcss css gets an empty inline map (no sources) — a
+  // real gap (vitejs/vite#23028). The isBundledDev branch below is the desired
+  // behavior (same as the lightningcss twin); un-skipping is the whole fix.
   test.skipIf(isBundledDev)('imported css', async () => {
     const css = await getStyleTagContentIncluding('.imported ')
     const map = extractSourcemap(css)
+    if (isBundledDev) {
+      expectBundledDevStyleMap(map, css, ['imported.css'])
+      return
+    }
     expect(formatSourcemapForSnapshot(map, css)).toMatchInlineSnapshot(`
       SourceMap {
         content: {

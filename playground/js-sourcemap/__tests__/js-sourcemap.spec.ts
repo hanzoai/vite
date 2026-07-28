@@ -75,16 +75,21 @@ function expectConsoleLogArgumentMapsToOriginalX(
 // instead (vitejs/vite#23028).
 async function getServedEntryChunk() {
   // poll: right after navigation the server may still answer with the
-  // self-reloading fallback page, which has no external script tag
-  const srcMatch = await vi.waitUntil(
+  // self-reloading fallback page, which has no external script tag; waitFor
+  // (not waitUntil) so a transient request failure retries instead of aborting
+  const srcMatches = await vi.waitFor(
     async () => {
       const html = await (await page.request.get(page.url())).text()
-      return html.match(/<script[^>]* src="([^"]+)"/)
+      const matches = [...html.matchAll(/<script[^>]* src="([^"]+)"/g)]
+      expect(matches.length).toBeGreaterThan(0)
+      return matches
     },
     { timeout: 10_000 },
   )
-  expect(srcMatch).toBeTruthy()
-  const entryUrl = new URL(srcMatch![1], page.url())
+  // every bundled-dev assertion reads this one chunk's map; fail loudly here
+  // if the dev bundle ever starts splitting the entry
+  expect(srcMatches).toHaveLength(1)
+  const entryUrl = new URL(srcMatches[0][1], page.url())
   const js = await (await page.request.get(entryUrl.href)).text()
   const mapUrlMatch = js.match(/^\/\/# sourceMappingURL=(\S+)$/m)
   expect(mapUrlMatch).toBeTruthy()
@@ -315,6 +320,13 @@ if (!isBuild) {
       expect(
         map.sources.some((source: string) =>
           source.includes('test-dep-malicious-sourcemap'),
+        ),
+      ).toBe(true)
+      // the optimized-deps test below is skipped on the promise that this
+      // whole-map scan covers its dep too — enforce that promise
+      expect(
+        map.sources.some((source: string) =>
+          source.includes('test-dep-optimized-malicious'),
         ),
       ).toBe(true)
       expect(map.sourcesContent).toBeDefined()
