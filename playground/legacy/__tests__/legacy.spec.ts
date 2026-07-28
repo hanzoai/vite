@@ -63,7 +63,11 @@ test('generates assets', async () => {
           ? [
               // the bundle's entry is served at the unhashed /assets/index.js;
               // legacy chunks don't exist (legacy plugin is build-only) and
-              // other chunks are hashed, so those requests fall back to html
+              // other chunks are hashed, so those requests fall back to html.
+              // `immutable-chunk` is hashed here because the dev bundle does
+              // not apply `build.rolldownOptions.output` naming — whether it
+              // should is an open design point, not asserted as final
+              // (vitejs/vite#23028)
               'index: text/javascript',
               'index-legacy: text/html',
               'chunk-async: text/html',

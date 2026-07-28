@@ -16,7 +16,8 @@ test('should load literal dynamic import', async () => {
 })
 
 // bundled dev: the `@vite-ignore` import requests /views/qux.js at runtime,
-// which needs static serving of root files; only the bundle output is served
+// which needs static serving of root files; only the bundle output is served.
+// A real gap, not a permanent N/A — tracked under vitejs/vite#23028
 test.skipIf(isBundledDev)(
   'should load full dynamic import from public',
   async () => {
