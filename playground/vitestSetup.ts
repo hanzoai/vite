@@ -25,7 +25,7 @@ import type {
   RolldownWatcherEvent,
   RollupError,
 } from 'rolldown'
-import { beforeAll, expect, inject, vi } from 'vitest'
+import { afterEach, beforeAll, expect, inject, vi } from 'vitest'
 
 // #region serializer
 
@@ -286,6 +286,122 @@ async function loadConfig(configEnv: ConfigEnv) {
   return merged
 }
 
+/** playgrounds that assert the bundling-fallback page itself — exempt from settle guards */
+const FALLBACK_ASSERTING_PLAYGROUNDS = ['hmr-full-bundle-mode']
+
+/** bumped by editFile/addFile/removeFile (test-utils) */
+export let fileMutationCount = 0
+export function noteFileMutation(): void {
+  fileMutationCount++
+}
+
+/**
+ * Waits until bundled dev has finished processing the latest change and the
+ * page is at rest. Every condition is a definite state, not a timing guess,
+ * so slow builds just make it wait longer:
+ *   - the server saw a change past `afterHmrEventCount`
+ *      (if passed, has the dev engine seen the latest file edit yet?)
+ *   - no full reload is waiting to be sent (server) or started (page marker)
+ *   - the page is loaded and not the fallback page (unless the build errored,
+ *     which keeps the fallback up legitimately)
+ *   - the page's client registered after the latest reload send
+ * A loaded page without the client runtime (e.g. SSR) counts as settled.
+ * Prefer `withPageReload` (test-utils) over calling this directly.
+ */
+export async function waitForBundledDevSettled(opts?: {
+  /** first wait until the server has seen a change past this count */
+  afterHmrEventCount?: number
+  timeout?: number
+}): Promise<void> {
+  if (!isBundledDev || !page) return
+  // not public API — reached via `as any`
+  const tracker = (viteServer as any)?.environments?.client?.bundledDev
+    ?.testTracker
+  if (!tracker) return
+  const deadline = performance.now() + (opts?.timeout ?? 40_000)
+  const remaining = () => Math.max(1, deadline - performance.now())
+  if (opts?.afterHmrEventCount !== undefined) {
+    await vi.waitUntil(
+      () => tracker.getState().hmrEventCount > opts.afterHmrEventCount!,
+      { timeout: remaining(), interval: 20 },
+    )
+  }
+  await vi.waitUntil(
+    async () => {
+      try {
+        if (tracker.getState().hasUnsentFullReload) return false
+        if (page.isClosed()) return true
+        const state = await page
+          .evaluate(() => ({
+            loaded: document.readyState === 'complete',
+            pendingReload: !!(globalThis as any).__vite_pending_reload__,
+            isFallback: !!(globalThis as any).__vite_is_fallback_page__,
+            hasRuntime: !!(globalThis as any).__rolldown_runtime__,
+            clientId: (globalThis as any).__rolldown_runtime__?.clientId as
+              | string
+              | undefined,
+          }))
+          .catch(() => undefined)
+        if (!state || !state.loaded || state.pendingReload) return false
+        if (state.isFallback) return tracker.getState().hasBuildError
+        if (
+          state.hasRuntime &&
+          (!state.clientId || !tracker.isClientCurrent(state.clientId))
+        ) {
+          return false
+        }
+        return !tracker.getState().hasUnsentFullReload
+      } catch {
+        // transient server-side errors (e.g. engine closing) — keep polling
+        return false
+      }
+    },
+    { timeout: remaining(), interval: 20 },
+  )
+}
+
+export function getBundledDevHmrEventCount(): number | undefined {
+  return (
+    viteServer as any
+  )?.environments?.client?.bundledDev?.testTracker.getState().hmrEventCount
+}
+
+// settle-guard bookkeeping: what the last guard pass had already seen
+let guardSeenMutations = 0
+let guardSeenHmrEvents = 0
+
+afterEach(async (ctx) => {
+  // No test may hand the next one a page with updates or navigations still
+  // in flight. Reload-expecting tests should still use `withPageReload`.
+  if (
+    !isBundledDev ||
+    FALLBACK_ASSERTING_PLAYGROUNDS.includes(testName) ||
+    !page ||
+    page.isClosed()
+  ) {
+    return
+  }
+  if (fileMutationCount > guardSeenMutations) {
+    // best-effort only: a mutation of an unwatched file never produces an event
+    const seen = guardSeenHmrEvents
+    await vi
+      .waitUntil(() => (getBundledDevHmrEventCount() ?? seen + 1) > seen, {
+        timeout: 2_000,
+        interval: 20,
+      })
+      .catch(() => {})
+  }
+  try {
+    await waitForBundledDevSettled({ timeout: 10_000 })
+  } catch {
+    console.warn(
+      `[bundled-dev settle guard] "${ctx.task.name}" did not settle within 10s — later tests may see its trailing updates`,
+    )
+  }
+  guardSeenMutations = fileMutationCount
+  guardSeenHmrEvents = getBundledDevHmrEventCount() ?? guardSeenHmrEvents
+})
+
 export async function startDefaultServe(): Promise<void> {
   setupConsoleWarnCollector(serverLogs)
 
@@ -306,16 +422,18 @@ export async function startDefaultServe(): Promise<void> {
     // tests are expected to handle that state themselves.
     // hmr-full-bundle-mode is exempt — it asserts the fallback page itself.
     if (isBundledDev && testName !== 'hmr-full-bundle-mode') {
-      // `initialBuildCompleted` / `lastBuildError` are private — the harness
-      // reaches in rather than widening the public API for tests only.
-      const bundledDev = server.environments.client.bundledDev as any
-      if (bundledDev) {
+      const tracker = (server.environments.client.bundledDev as any)
+        ?.testTracker
+      if (tracker) {
         await vi.waitUntil(
-          () => bundledDev.initialBuildCompleted || bundledDev.lastBuildError,
+          () => {
+            const s = tracker.getState()
+            return s.initialBuildCompleted || s.hasBuildError
+          },
           { timeout: 40_000 },
         )
       }
-      if (bundledDev?.initialBuildCompleted) {
+      if (tracker?.getState().initialBuildCompleted) {
         await page
           .waitForFunction(
             () => !(globalThis as any).__vite_is_fallback_page__,
@@ -324,27 +442,9 @@ export async function startDefaultServe(): Promise<void> {
           )
           .catch(() => {})
         // TODO: workaround — an edit fired while no client is connected is
-        // dropped (vitejs/vite#23028). Remove this wait once the server
-        // buffers updates for clients that connect later. A page that never
-        // loads the client runtime (e.g. SSR-rendered pages) cannot register
-        // a client; a fully loaded page with no runtime counts as settled.
-        await vi.waitUntil(
-          async () => {
-            const state = await page
-              .evaluate(() => ({
-                loaded: document.readyState === 'complete',
-                hasRuntime: !!(globalThis as any).__rolldown_runtime__,
-                clientId: (globalThis as any).__rolldown_runtime__?.clientId,
-              }))
-              .catch(() => undefined)
-            if (!state) return false
-            if (state.clientId && bundledDev.clients?.get(state.clientId)) {
-              return true
-            }
-            return state.loaded && !state.hasRuntime
-          },
-          { timeout: 10_000 },
-        )
+        // dropped (vitejs/vite#23028). Remove this settle once the server
+        // buffers updates for clients that connect later.
+        await waitForBundledDevSettled()
       }
     }
   } else {

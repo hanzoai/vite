@@ -66,6 +66,7 @@ export class BundledDev {
   private _closed = false
   private clients = new Clients()
   private debouncedFullReload = debounce(20, () => {
+    this.testTracker.reloadSent()
     this.environment.hot.send({ type: 'full-reload', path: '*' })
     this.environment.logger.info(colors.green(`page reload`), {
       timestamp: true,
@@ -75,6 +76,11 @@ export class BundledDev {
   private fullReloadPending = false
 
   private lastBuildError: Error | null = null
+
+  private testTracker = new TestTracker(() => ({
+    initialBuildCompleted: this.initialBuildCompleted,
+    hasBuildError: this.lastBuildError != null,
+  }))
 
   memoryFiles: MemoryFiles = new MemoryFiles()
 
@@ -116,6 +122,7 @@ export class BundledDev {
       'vite:client-connected',
       async (payload, client) => {
         this.clients.setupIfNeeded(client, payload.clientId)
+        this.testTracker.clientRegistered(payload.clientId)
         this.devEngine.registerClient(payload.clientId)
       },
     )
@@ -133,12 +140,14 @@ export class BundledDev {
     this.environment.hot.on('vite:client:disconnect', (_payload, client) => {
       const clientId = this.clients.delete(client)
       if (clientId) {
+        this.testTracker.clientRemoved(clientId)
         this.devEngine.removeClient(clientId)
       }
     })
 
     this._devEngine = await dev(rolldownOptions, outputOptions, {
       onHmrUpdates: (result) => {
+        this.testTracker.hmrBatchSeen()
         if (result instanceof Error) {
           this.environment.logger.error(
             colors.red(`✘ Build error: ${result.message}`),
@@ -184,6 +193,8 @@ export class BundledDev {
             type: 'error',
             err: prepareError(result),
           })
+          // the error overlay replaces any reload owed for this build
+          this.testTracker.reloadsCancelled()
           return
         }
         this.lastBuildError = null
@@ -254,9 +265,7 @@ export class BundledDev {
       debug?.(`TRIGGER: access after HMR-stage failure, forcing full rebuild`)
 
       this.devEngine.triggerFullBuild()
-      this.devEngine.ensureLatestBuildOutput().then(() => {
-        this.debouncedFullReload()
-      })
+      this.scheduleReloadAfterBuild()
       return true
     }
 
@@ -265,12 +274,25 @@ export class BundledDev {
       !bundleState.lastBuildErrored &&
       this.initialBuildCompleted
     if (shouldTrigger) {
-      this.devEngine.ensureLatestBuildOutput().then(() => {
-        this.debouncedFullReload()
-      })
+      this.scheduleReloadAfterBuild()
       debug?.(`TRIGGER: access to stale bundle, triggered bundle re-generation`)
     }
     return shouldTrigger
+  }
+
+  private scheduleReloadAfterBuild(): void {
+    this.testTracker.reloadDecided()
+    this.devEngine
+      .ensureLatestBuildOutput()
+      .then(async () => {
+        // resolves even on build failure — don't reload onto the error
+        // overlay (`onOutput` already cleared the pending count)
+        if (!(await this.devEngine.getBundleState()).lastBuildErrored) {
+          this.debouncedFullReload()
+        }
+      })
+      // rejects only when the engine is closing
+      .catch(() => {})
   }
 
   async triggerLazyBundling(
@@ -410,6 +432,7 @@ export class BundledDev {
       // reload comes from a file change: defer it until the `onOutput` callback to
       // avoid error overlay flashes.
       this.fullReloadPending = true
+      this.testTracker.reloadDecided()
       return
     }
 
@@ -451,6 +474,77 @@ export class BundledDev {
         timestamp: true,
       },
     )
+  }
+}
+
+/**
+ * Tracking used only by the playground test harness.
+ */
+class TestTracker {
+  // Pending reloads that the server has decided to send but has not yet sent.
+  // It resets to 0 when the server sends a full-reload event or
+  // when the server cancels the reloads due to a build error.
+  private pendingReloads = 0
+
+  private hmrEventCount = 0
+
+  private fullReloadsSent = 0
+  private clientEpochs = new Map<string, number>()
+
+  constructor(
+    private getBuildState: () => {
+      initialBuildCompleted: boolean
+      hasBuildError: boolean
+    },
+  ) {}
+
+  reloadDecided(): void {
+    this.pendingReloads++
+  }
+
+  reloadSent(): void {
+    this.pendingReloads = 0
+    this.fullReloadsSent++
+  }
+
+  reloadsCancelled(): void {
+    this.pendingReloads = 0
+  }
+
+  hmrBatchSeen(): void {
+    this.hmrEventCount++
+  }
+
+  clientRegistered(clientId: string): void {
+    this.clientEpochs.set(clientId, this.fullReloadsSent)
+  }
+
+  clientRemoved(clientId: string): void {
+    this.clientEpochs.delete(clientId)
+  }
+
+  // Whether the given client has received all full reloads that the server has sent so far.
+  //
+  // The client has two states:
+  // 1. Current: the client has received all full reloads sent by the server.
+  // 2. Stale: the client has not received all full reloads sent by the server.
+  //    In this case, the client will reload by the event `vite:full-reload` sent by the server in `debouncedFullReload`.
+  isClientCurrent(clientId: string): boolean {
+    const epoch = this.clientEpochs.get(clientId)
+    return epoch != null && epoch >= this.fullReloadsSent
+  }
+
+  getState(): {
+    hasUnsentFullReload: boolean
+    hmrEventCount: number
+    initialBuildCompleted: boolean
+    hasBuildError: boolean
+  } {
+    return {
+      hasUnsentFullReload: this.pendingReloads > 0,
+      hmrEventCount: this.hmrEventCount,
+      ...this.getBuildState(),
+    }
   }
 }
 
