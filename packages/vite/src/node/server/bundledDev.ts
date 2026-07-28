@@ -282,17 +282,9 @@ export class BundledDev {
 
   private scheduleReloadAfterBuild(): void {
     this.testTracker.reloadDecided()
-    this.devEngine
-      .ensureLatestBuildOutput()
-      .then(async () => {
-        // resolves even on build failure — don't reload onto the error
-        // overlay (`onOutput` already cleared the pending count)
-        if (!(await this.devEngine.getBundleState()).lastBuildErrored) {
-          this.debouncedFullReload()
-        }
-      })
-      // rejects only when the engine is closing
-      .catch(() => {})
+    this.devEngine.ensureLatestBuildOutput().then(() => {
+      this.debouncedFullReload()
+    })
   }
 
   async triggerLazyBundling(
