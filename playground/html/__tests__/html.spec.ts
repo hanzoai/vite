@@ -4,6 +4,7 @@ import {
   editFile,
   getColor,
   isBuild,
+  isBundled,
   isBundledDev,
   isServe,
   page,
@@ -287,7 +288,7 @@ describe.runIf(isServe)('SPA fallback', () => {
 })
 
 // bundled dev: invalid*.html are not bundle inputs, so they fall back to index.html (200) and are never parsed — no 500 or error overlay (vitejs/vite#23028)
-describe.runIf(isServe && !isBundledDev)('invalid', () => {
+describe.runIf(!isBundled)('invalid', () => {
   test('should be 500 with overlay', async () => {
     const response = await page.goto(viteTestUrl + '/invalid.html')
     expect(response.status()).toBe(500)
@@ -436,7 +437,7 @@ describe('relative input', () => {
 })
 
 // bundled dev: server.moduleGraph stays empty by design (the bundle owns transforms), so warmup is not observable through it (vitejs/vite#23028)
-describe.runIf(isServe && !isBundledDev)('warmup', () => {
+describe.runIf(!isBundled)('warmup', () => {
   test('should warmup /warmup/warm.js', async () => {
     // warmup transform files async during server startup, so the module check
     // here might take a while to load
