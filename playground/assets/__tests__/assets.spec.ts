@@ -797,9 +797,11 @@ if (!isBuild) {
   // bundled dev: editing a CSS file imported by an inline <style> @import does not apply (no reload/update) (vitejs/vite#23028)
   test.skipIf(isBundledDev)('@import in html style tag hmr', async () => {
     await expect.poll(() => getColor('.import-css')).toBe('rgb(0, 136, 255)')
-    const loadPromise = page.waitForEvent('load')
-    editFile('./css/import.css', (code) => code.replace('#0088ff', '#00ff88 '))
-    await loadPromise
+    await withPageReload(() =>
+      editFile('./css/import.css', (code) =>
+        code.replace('#0088ff', '#00ff88 '),
+      ),
+    )
     await expect.poll(() => getColor('.import-css')).toBe('rgb(0, 255, 136)')
   })
 }
