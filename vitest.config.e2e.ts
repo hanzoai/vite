@@ -30,7 +30,6 @@ const bundledDevExclude = [
   './playground/fs-serve/__tests__/deny/fs-serve-deny.spec.ts',
   './playground/fs-serve/__tests__/fs-serve.spec.ts',
   './playground/hmr/__tests__/hmr.spec.ts',
-  './playground/html/__tests__/html.spec.ts',
   './playground/js-sourcemap/__tests__/js-sourcemap.spec.ts',
   './playground/legacy/__tests__/chunk-importmap/legacy-chunk-importmap.spec.ts',
   './playground/module-graph/__tests__/module-graph.spec.ts',
