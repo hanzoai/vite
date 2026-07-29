@@ -128,9 +128,6 @@ const outdatedLinkTags = new WeakSet<HTMLLinkElement>()
 const debounceReload = (time: number) => {
   let timer: ReturnType<typeof setTimeout> | null
   return () => {
-    // the only observable sign of a decided-but-not-started navigation;
-    // cleared by the navigation itself (fresh globals)
-    ;(globalThis as any).__vite_pending_reload__ = true
     if (timer) {
       clearTimeout(timer)
       timer = null

@@ -275,7 +275,10 @@ async function loadConfig(configEnv: ConfigEnv) {
       target: 'esnext',
     },
     customLogger: createInMemoryLogger(serverLogs),
-    plugins: [throwHtmlParseError()],
+    plugins: [
+      throwHtmlParseError(),
+      ...(isBundledDev ? [bundledDevSettle()] : []),
+    ],
   }
   let merged = mergeConfig(options, config || {})
   // applied after the merge so the playground's own config cannot turn it off —
@@ -294,6 +297,219 @@ export let fileMutationCount = 0
 export function noteFileMutation(): void {
   fileMutationCount++
 }
+
+// #region bundled-dev settle plugin
+
+/** the rolldown module the bundled-dev client implement is appended to */
+const ROLLDOWN_RUNTIME_MODULE_ID = '\0rolldown/runtime.js'
+
+/**
+ * Reload ledger kept by the `bundledDevSettle` plugin for the current server:
+ * `decided` counts reloads the server has committed to send, `sent` counts
+ * `full-reload` events that actually went out. A send pays every decision owed
+ * so far (the server debounce merges them), so `decided === sent` means no
+ * reload is owed. `clientEpochs` stamps each client with the value of `sent`
+ * at registration (client current ⟺ epoch >= sent); `clientLastSentSeq` holds
+ * the seq of the last `bundled-dev-update` patch sent to each client.
+ */
+interface BundledDevSettleState {
+  bundledDev: unknown
+  decided: number
+  sent: number
+  clientEpochs: Map<string, number>
+  clientLastSentSeq: Map<string, number>
+}
+
+let settleState: BundledDevSettleState | undefined
+
+/**
+ * Monotone count of `watchChange` calls: the dev engine awaits the hook once
+ * per changed file before it starts rebuilding, so a bump means the engine has
+ * seen the change. Never reset (survives server restarts).
+ */
+let watchChangeCount = 0
+const watchChangeCountByPath = new Map<string, number>()
+
+/** prototype wraps outlive server restarts — apply once, route into `settleState` */
+let bundledDevPrototypeWrapped = false
+
+/**
+ * Instrumentation appended to the bundle after the vite client implement.
+ * `__settle_reload_pending` is the only observable sign of a
+ * decided-but-not-started navigation; the navigation itself clears it (fresh
+ * globals). `__settle_applied_seq` advances once the client's apply queue has
+ * fully processed a pushed patch.
+ */
+const SETTLE_CLIENT_INSTRUMENTATION = `
+;(() => {
+  // test-only settle instrumentation appended by playground/vitestSetup.ts
+  if (typeof BundledDevHMRClient === 'undefined') return
+  try {
+    const proto = BundledDevHMRClient.prototype
+    const origHandlePush = proto.handlePush
+    proto.handlePush = function (payload) {
+      const seq = payload && payload.seq
+      origHandlePush.call(this, payload)
+      // applyQueue is the client's serialization point — it settles once the
+      // push is applied, turned into a reload, or dropped as a silent noop
+      this.applyQueue = this.applyQueue.then(() => {
+        globalThis.__settle_applied_seq = seq
+      })
+    }
+    const origRequestFullReload = proto.requestFullReload
+    proto.requestFullReload = function (reason) {
+      // set before the (debounced) reload starts, so the flag is never late
+      globalThis.__settle_reload_pending = true
+      return origRequestFullReload.call(this, reason)
+    }
+    if (globalThis.__rolldown_runtime__) {
+      // server-sent full reloads notify listeners before reloading
+      globalThis.__rolldown_runtime__
+        .createModuleHotContext('/__settle__')
+        .on('vite:beforeFullReload', () => {
+          globalThis.__settle_reload_pending = true
+        })
+    }
+    if (typeof window !== 'undefined' && window.addEventListener) {
+      // covers reloads that skip the flags above (e.g. the
+      // overlay-on-first-update path calls location.reload() directly)
+      window.addEventListener('pagehide', () => {
+        globalThis.__settle_reload_pending = true
+      })
+    }
+  } catch (e) {
+    console.error('[bundled-dev settle] client instrumentation failed', e)
+  }
+})()
+`
+
+/**
+ * Test-only plugin providing the tracking `waitForBundledDevSettled` reads:
+ * it counts watched-file changes, keeps the server-side reload ledger, and
+ * appends `SETTLE_CLIENT_INSTRUMENTATION` to the client bundle. Installed by
+ * `loadConfig` only when `isBundledDev`.
+ */
+function bundledDevSettle(): PluginOption {
+  const missing = (what: string) =>
+    new Error(
+      `[bundled-dev settle] ${what} is missing — production code changed, update the harness plugin in playground/vitestSetup.ts`,
+    )
+  return {
+    name: 'vite-plugin-test-bundled-dev-settle',
+    watchChange(id: string) {
+      watchChangeCount++
+      watchChangeCountByPath.set(id, (watchChangeCountByPath.get(id) ?? 0) + 1)
+    },
+    transform(code: string, id: string) {
+      if (id !== ROLLDOWN_RUNTIME_MODULE_ID) return null
+      // rolldown's hmr plugin appended the vite client implement to this
+      // module in its Pre-stage transform, so this appends into the same
+      // scope, after it. `map: null` is correct: no existing code moved.
+      return { code: code + SETTLE_CLIENT_INSTRUMENTATION, map: null }
+    },
+    configureServer(server: ViteDevServer) {
+      // runs before `bundledDev.listen()` (fired from `httpServer.listen`),
+      // so every wrap is in place before the dev engine starts
+      const clientEnv = server.environments.client
+      const bundledDev = (clientEnv as any).bundledDev
+      if (!bundledDev) throw missing('server.environments.client.bundledDev')
+      const proto = Object.getPrototypeOf(bundledDev)
+      if (typeof proto.handleHmrOutput !== 'function') {
+        throw missing('BundledDev.prototype.handleHmrOutput')
+      }
+      if (typeof proto.scheduleReloadAfterBuild !== 'function') {
+        throw missing('BundledDev.prototype.scheduleReloadAfterBuild')
+      }
+      const hot = clientEnv.hot as any
+      if (typeof hot?.send !== 'function' || typeof hot?.on !== 'function') {
+        throw missing('server.environments.client.hot.send/on')
+      }
+
+      // fresh ledger per server generation (`server.restart()` re-runs this)
+      const state: BundledDevSettleState = {
+        bundledDev,
+        decided: 0,
+        sent: 0,
+        clientEpochs: new Map(),
+        clientLastSentSeq: new Map(),
+      }
+      settleState = state
+
+      if (!bundledDevPrototypeWrapped) {
+        bundledDevPrototypeWrapped = true
+        const origHandleHmrOutput = proto.handleHmrOutput
+        proto.handleHmrOutput = function (
+          client: unknown,
+          files: unknown,
+          hmrOutput: any,
+        ) {
+          // a FullReload decision defers its send to the `onOutput` callback
+          if (settleState && hmrOutput?.type === 'FullReload') {
+            settleState.decided++
+          }
+          return origHandleHmrOutput.call(this, client, files, hmrOutput)
+        }
+        const origScheduleReload = proto.scheduleReloadAfterBuild
+        proto.scheduleReloadAfterBuild = function () {
+          if (settleState) settleState.decided++
+          return origScheduleReload.call(this)
+        }
+      }
+
+      // canonical `sent` site: every full reload, whoever triggers it, goes
+      // through `hot.send`
+      const origHotSend = hot.send.bind(hot)
+      hot.send = (...args: any[]) => {
+        const payload = args[0]
+        if (payload && typeof payload === 'object') {
+          // `ifFallback` reloads only address the bundling-fallback page
+          if (payload.type === 'full-reload' && !payload.ifFallback) {
+            state.sent++
+            // one send pays every reload owed so far (the debounce merges them)
+            state.decided = state.sent
+          } else if (payload.type === 'error') {
+            // the error overlay replaces any reload owed for this build
+            state.decided = state.sent
+          }
+        }
+        return origHotSend(...args)
+      }
+
+      const clientIdByClient = new WeakMap<object, string>()
+      const wrappedClients = new WeakSet<object>()
+      hot.on('vite:client-connected', (payload: any, client: any) => {
+        const clientId = payload?.clientId
+        if (typeof clientId !== 'string') return
+        state.clientEpochs.set(clientId, state.sent)
+        clientIdByClient.set(client, clientId)
+        // `client` is the same normalized object bundledDev keeps (normalized
+        // clients are cached per connection), so wrapping its `send` observes
+        // the per-client `bundled-dev-update` patches
+        if (typeof client?.send === 'function' && !wrappedClients.has(client)) {
+          wrappedClients.add(client)
+          const origClientSend = client.send.bind(client)
+          client.send = (p: any) => {
+            const id = clientIdByClient.get(client)
+            if (id !== undefined && p?.type === 'bundled-dev-update') {
+              state.clientLastSentSeq.set(id, p.seq)
+            }
+            return origClientSend(p)
+          }
+        }
+      })
+      hot.on('vite:client:disconnect', (_payload: any, client: any) => {
+        const clientId = clientIdByClient.get(client)
+        if (clientId !== undefined) {
+          clientIdByClient.delete(client)
+          state.clientEpochs.delete(clientId)
+          state.clientLastSentSeq.delete(clientId)
+        }
+      })
+    },
+  }
+}
+
+// #endregion
 
 /**
  * Waits until bundled dev has finished processing the latest change and the
@@ -315,42 +531,71 @@ export async function waitForBundledDevSettled(opts?: {
 }): Promise<void> {
   if (!isBundledDev || !page) return
   // not public API — reached via `as any`
-  const tracker = (viteServer as any)?.environments?.client?.bundledDev
-    ?.testTracker
-  if (!tracker) return
+  const bundledDev = (viteServer as any)?.environments?.client?.bundledDev
+  const state = settleState
+  // only servers created through `loadConfig` carry the settle plugin
+  if (!bundledDev || !state || state.bundledDev !== bundledDev) return
   const deadline = performance.now() + (opts?.timeout ?? 40_000)
   const remaining = () => Math.max(1, deadline - performance.now())
   if (opts?.afterHmrEventCount !== undefined) {
-    await vi.waitUntil(
-      () => tracker.getState().hmrEventCount > opts.afterHmrEventCount!,
-      { timeout: remaining(), interval: 20 },
-    )
+    await vi.waitUntil(() => watchChangeCount > opts.afterHmrEventCount!, {
+      timeout: remaining(),
+      interval: 20,
+    })
   }
+  // Reload decisions reach the ledger when the wraps run, inside the closures
+  // the dev engine enqueues (`onHmrUpdates` / `onOutput`) — an enqueued but
+  // not-yet-run closure is invisible to the ledger for a tick. The
+  // `afterHmrEventCount` pre-wait (`watchChange` fires before the rebuild),
+  // `ensureCurrentBuildFinish()` and the ledger re-check after the page probe
+  // bound that window. TODO: harden with a sentinel flushed through the
+  // engine's queue so the ledger is provably caught up.
   await vi.waitUntil(
     async () => {
       try {
-        if (tracker.getState().hasUnsentFullReload) return false
+        // ledger balanced: every decided reload has been sent
+        if (state.decided !== state.sent) return false
         if (page.isClosed()) return true
-        const state = await page
+        const devEngine = (bundledDev as any)._devEngine
+        let lastBuildErrored = false
+        if (devEngine) {
+          await devEngine.ensureCurrentBuildFinish()
+          lastBuildErrored = (await devEngine.getBundleState()).lastBuildErrored
+        }
+        const pageState = await page
           .evaluate(() => ({
             loaded: document.readyState === 'complete',
-            pendingReload: !!(globalThis as any).__vite_pending_reload__,
+            pendingReload: !!(globalThis as any).__settle_reload_pending,
             isFallback: !!(globalThis as any).__vite_is_fallback_page__,
             hasRuntime: !!(globalThis as any).__rolldown_runtime__,
             clientId: (globalThis as any).__rolldown_runtime__?.clientId as
               | string
               | undefined,
+            appliedSeq: (globalThis as any).__settle_applied_seq as
+              | number
+              | undefined,
           }))
           .catch(() => undefined)
-        if (!state || !state.loaded || state.pendingReload) return false
-        if (state.isFallback) return tracker.getState().hasBuildError
-        if (
-          state.hasRuntime &&
-          (!state.clientId || !tracker.isClientCurrent(state.clientId))
-        ) {
+        if (!pageState || !pageState.loaded || pageState.pendingReload) {
           return false
         }
-        return !tracker.getState().hasUnsentFullReload
+        // the fallback page is legitimate only while the build is broken
+        if (pageState.isFallback) return lastBuildErrored
+        if (pageState.hasRuntime) {
+          if (!pageState.clientId) return false
+          const epoch = state.clientEpochs.get(pageState.clientId)
+          if (epoch === undefined || epoch < state.sent) return false
+          // the last patch sent to this client went through its apply queue
+          // (`undefined === undefined` when nothing was sent yet)
+          if (
+            pageState.appliedSeq !==
+            state.clientLastSentSeq.get(pageState.clientId)
+          ) {
+            return false
+          }
+        }
+        // re-check: a reload decision may have landed while probing the page
+        return state.decided === state.sent
       } catch {
         // transient server-side errors (e.g. engine closing) — keep polling
         return false
@@ -361,9 +606,11 @@ export async function waitForBundledDevSettled(opts?: {
 }
 
 export function getBundledDevHmrEventCount(): number | undefined {
-  return (
-    viteServer as any
-  )?.environments?.client?.bundledDev?.testTracker.getState().hmrEventCount
+  const bundledDev = (viteServer as any)?.environments?.client?.bundledDev
+  if (!bundledDev || !settleState || settleState.bundledDev !== bundledDev) {
+    return undefined
+  }
+  return watchChangeCount
 }
 
 // settle-guard bookkeeping: what the last guard pass had already seen
@@ -422,18 +669,16 @@ export async function startDefaultServe(): Promise<void> {
     // tests are expected to handle that state themselves.
     // hmr-full-bundle-mode is exempt — it asserts the fallback page itself.
     if (isBundledDev && testName !== 'hmr-full-bundle-mode') {
-      const tracker = (server.environments.client.bundledDev as any)
-        ?.testTracker
-      if (tracker) {
+      // `initialBuildCompleted` / `lastBuildError` are private — the harness
+      // reaches in rather than widening the public API for tests only.
+      const bundledDev = server.environments.client.bundledDev as any
+      if (bundledDev) {
         await vi.waitUntil(
-          () => {
-            const s = tracker.getState()
-            return s.initialBuildCompleted || s.hasBuildError
-          },
+          () => bundledDev.initialBuildCompleted || bundledDev.lastBuildError,
           { timeout: 40_000 },
         )
       }
-      if (tracker?.getState().initialBuildCompleted) {
+      if (bundledDev?.initialBuildCompleted) {
         await page
           .waitForFunction(
             () => !(globalThis as any).__vite_is_fallback_page__,
