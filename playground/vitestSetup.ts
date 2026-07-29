@@ -304,18 +304,30 @@ export function noteFileMutation(): void {
 const ROLLDOWN_RUNTIME_MODULE_ID = '\0rolldown/runtime.js'
 
 /**
- * Reload ledger kept by the `bundledDevSettle` plugin for the current server:
- * `decided` counts reloads the server has committed to send, `sent` counts
- * `full-reload` events that actually went out. A send pays every decision owed
- * so far (the server debounce merges them), so `decided === sent` means no
- * reload is owed. `clientEpochs` stamps each client with the value of `sent`
- * at registration (client current ⟺ epoch >= sent); `clientLastSentSeq` holds
- * the seq of the last `bundled-dev-update` patch sent to each client.
+ * Reload ledger kept by the `bundledDevSettle` plugin for the current server.
+ * Owed reloads are split by decision kind because production cancels them
+ * differently: an error broadcast cancels the HMR-decided reload (the server
+ * clears `fullReloadPending`), but a reload scheduled by
+ * `triggerBundleRegenerationIfStale` still fires after an errored rebuild
+ * (`ensureLatestBuildOutput` resolves on failure), so only an actual send pays
+ * it. A `full-reload` send pays every owed reload at once (the server debounce
+ * merges them), so both counters being zero means no reload is on the way.
+ * `sent` counts `full-reload` events that went out; `clientEpochs` stamps each
+ * client with the value of `sent` at registration (client current ⟺ epoch >=
+ * sent); `clientLastSentSeq` holds the seq of the last `bundled-dev-update`
+ * patch sent to each client. `fallbackServeEpoch` holds the value of `sent`
+ * when the latest fallback page was served — a fallback page obeys every
+ * reload, so `sent > fallbackServeEpoch` means the current fallback page has
+ * a navigation on the way.
  */
 interface BundledDevSettleState {
   bundledDev: unknown
-  decided: number
+  /** owed reloads decided via HMR `FullReload` output (error broadcast cancels these) */
+  owedHmr: number
+  /** owed reloads scheduled by `triggerBundleRegenerationIfStale` (paid only by a send) */
+  owedScheduled: number
   sent: number
+  fallbackServeEpoch: number
   clientEpochs: Map<string, number>
   clientLastSentSeq: Map<string, number>
 }
@@ -328,9 +340,13 @@ let settleState: BundledDevSettleState | undefined
  * seen the change. Never reset (survives server restarts).
  */
 let watchChangeCount = 0
-const watchChangeCountByPath = new Map<string, number>()
 
-/** prototype wraps outlive server restarts — apply once, route into `settleState` */
+/**
+ * prototype wraps outlive server restarts — apply once; each call charges
+ * `settleState` only when the calling instance is the current generation's
+ * (during a restart the old server stays live while the new one is built, and
+ * an old-generation decision must not be charged to the new ledger)
+ */
 let bundledDevPrototypeWrapped = false
 
 /**
@@ -338,7 +354,9 @@ let bundledDevPrototypeWrapped = false
  * `__settle_reload_pending` is the only observable sign of a
  * decided-but-not-started navigation; the navigation itself clears it (fresh
  * globals). `__settle_applied_seq` advances once the client's apply queue has
- * fully processed a pushed patch.
+ * fully processed a pushed patch. `__settle_instrumented` marks a successful
+ * install — the settle predicate refuses to trust an uninstrumented runtime,
+ * so a silent install failure cannot re-open the races this harness closes.
  */
 const SETTLE_CLIENT_INSTRUMENTATION = `
 ;(() => {
@@ -363,7 +381,11 @@ const SETTLE_CLIENT_INSTRUMENTATION = `
       return origRequestFullReload.call(this, reason)
     }
     if (globalThis.__rolldown_runtime__) {
-      // server-sent full reloads notify listeners before reloading
+      // server-sent full reloads notify listeners before reloading. Assumes
+      // bundled-dev reloads always use path '*' (true today: the vite watcher
+      // skips root and handleHmrUpdate returns early in this mode) — a
+      // path-specific '.html' reload aimed at another page would set the flag
+      // with no navigation following and wedge the settle wait
       globalThis.__rolldown_runtime__
         .createModuleHotContext('/__settle__')
         .on('vite:beforeFullReload', () => {
@@ -377,6 +399,7 @@ const SETTLE_CLIENT_INSTRUMENTATION = `
         globalThis.__settle_reload_pending = true
       })
     }
+    globalThis.__settle_instrumented = true
   } catch (e) {
     console.error('[bundled-dev settle] client instrumentation failed', e)
   }
@@ -396,12 +419,21 @@ function bundledDevSettle(): PluginOption {
     )
   return {
     name: 'vite-plugin-test-bundled-dev-settle',
-    watchChange(id: string) {
+    watchChange() {
       watchChangeCount++
-      watchChangeCountByPath.set(id, (watchChangeCountByPath.get(id) ?? 0) + 1)
     },
     transform(code: string, id: string) {
       if (id !== ROLLDOWN_RUNTIME_MODULE_ID) return null
+      if (!code.includes('BundledDevHMRClient')) {
+        // 'vite:client-connected' marks the inlined vite client implement; if
+        // the implement is present but the class name is not, the class was
+        // renamed and the appended instrumentation would silently no-op
+        if (code.includes('vite:client-connected')) {
+          throw missing('BundledDevHMRClient in the client implement')
+        }
+        // no implement in this bundle (e.g. a worker build) — skip
+        return null
+      }
       // rolldown's hmr plugin appended the vite client implement to this
       // module in its Pre-stage transform, so this appends into the same
       // scope, after it. `map: null` is correct: no existing code moved.
@@ -428,8 +460,10 @@ function bundledDevSettle(): PluginOption {
       // fresh ledger per server generation (`server.restart()` re-runs this)
       const state: BundledDevSettleState = {
         bundledDev,
-        decided: 0,
+        owedHmr: 0,
+        owedScheduled: 0,
         sent: 0,
+        fallbackServeEpoch: 0,
         clientEpochs: new Map(),
         clientLastSentSeq: new Map(),
       }
@@ -444,18 +478,29 @@ function bundledDevSettle(): PluginOption {
           hmrOutput: any,
         ) {
           // a FullReload decision defers its send to the `onOutput` callback
-          if (settleState && hmrOutput?.type === 'FullReload') {
-            settleState.decided++
+          const current = settleState
+          if (
+            current &&
+            current.bundledDev === this &&
+            hmrOutput?.type === 'FullReload'
+          ) {
+            current.owedHmr++
           }
           return origHandleHmrOutput.call(this, client, files, hmrOutput)
         }
-        // a `true` return means a fallback was served and a reload was
-        // scheduled for build completion (covers both the stale-output and
-        // the HMR-failure recovery branches)
+        // a `true` return means a fallback page is served for this request
+        // and a reload was scheduled for build completion (covers both the
+        // stale-output and the HMR-failure recovery branches)
         const origTriggerRegen = proto.triggerBundleRegenerationIfStale
         proto.triggerBundleRegenerationIfStale = async function () {
           const scheduled = await origTriggerRegen.call(this)
-          if (settleState && scheduled) settleState.decided++
+          // read `settleState` after the await: a restart may swap
+          // generations mid-call, and the identity check drops the decision
+          const current = settleState
+          if (current && current.bundledDev === this && scheduled) {
+            current.owedScheduled++
+            current.fallbackServeEpoch = current.sent
+          }
           return scheduled
         }
       }
@@ -469,11 +514,15 @@ function bundledDevSettle(): PluginOption {
           // `ifFallback` reloads only address the bundling-fallback page
           if (payload.type === 'full-reload' && !payload.ifFallback) {
             state.sent++
-            // one send pays every reload owed so far (the debounce merges them)
-            state.decided = state.sent
+            // one send pays every owed reload (the debounce merges them)
+            state.owedHmr = 0
+            state.owedScheduled = 0
           } else if (payload.type === 'error') {
-            // the error overlay replaces any reload owed for this build
-            state.decided = state.sent
+            // the error broadcast replaces only the HMR-decided reload (the
+            // server clears `fullReloadPending`); a scheduled regeneration
+            // reload still fires after an errored rebuild and stays owed
+            // until its send
+            state.owedHmr = 0
           }
         }
         return origHotSend(...args)
@@ -515,6 +564,9 @@ function bundledDevSettle(): PluginOption {
 
 // #endregion
 
+/** thrown through the settle poll (never swallowed): the harness itself is broken */
+class SettleHarnessError extends Error {}
+
 /**
  * Waits until bundled dev has finished processing the latest change and the
  * page is at rest. Every condition is a definite state, not a timing guess,
@@ -522,8 +574,9 @@ function bundledDevSettle(): PluginOption {
  *   - the server saw a change past `afterHmrEventCount`
  *      (if passed, has the dev engine seen the latest file edit yet?)
  *   - no full reload is waiting to be sent (server) or started (page marker)
- *   - the page is loaded and not the fallback page (unless the build errored,
- *     which keeps the fallback up legitimately)
+ *   - the page is loaded and not the fallback page (a fallback page counts
+ *     only while the build is broken AND no reload went out since it was
+ *     served — it obeys every reload, so a later send means it will navigate)
  *   - the page's client registered after the latest reload send
  * A loaded page without the client runtime (e.g. SSR) counts as settled.
  * Prefer `withPageReload` (test-utils) over calling this directly.
@@ -557,8 +610,8 @@ export async function waitForBundledDevSettled(opts?: {
   await vi.waitUntil(
     async () => {
       try {
-        // ledger balanced: every decided reload has been sent
-        if (state.decided !== state.sent) return false
+        // ledger clear: no decided or scheduled reload is waiting to be sent
+        if (state.owedHmr + state.owedScheduled !== 0) return false
         if (page.isClosed()) return true
         const devEngine = (bundledDev as any)._devEngine
         let lastBuildErrored = false
@@ -572,6 +625,7 @@ export async function waitForBundledDevSettled(opts?: {
             pendingReload: !!(globalThis as any).__settle_reload_pending,
             isFallback: !!(globalThis as any).__vite_is_fallback_page__,
             hasRuntime: !!(globalThis as any).__rolldown_runtime__,
+            instrumented: !!(globalThis as any).__settle_instrumented,
             clientId: (globalThis as any).__rolldown_runtime__?.clientId as
               | string
               | undefined,
@@ -583,9 +637,21 @@ export async function waitForBundledDevSettled(opts?: {
         if (!pageState || !pageState.loaded || pageState.pendingReload) {
           return false
         }
-        // the fallback page is legitimate only while the build is broken
-        if (pageState.isFallback) return lastBuildErrored
+        // the fallback page is legitimate only while the build is broken and
+        // no reload went out since it was served. (A send that beat the
+        // page's socket connect makes this block until the timeout — loud
+        // and attributable, unlike letting a possible navigation trail out.)
+        if (pageState.isFallback) {
+          return lastBuildErrored && state.sent === state.fallbackServeEpoch
+        }
         if (pageState.hasRuntime) {
+          // the transform guarantees instrumentation whenever the implement
+          // is in the bundle — a bare runtime means the harness is broken
+          if (!pageState.instrumented) {
+            throw new SettleHarnessError(
+              '[bundled-dev settle] the page has the rolldown runtime but the settle instrumentation did not install — check the browser console for "[bundled-dev settle] client instrumentation failed"',
+            )
+          }
           if (!pageState.clientId) return false
           const epoch = state.clientEpochs.get(pageState.clientId)
           if (epoch === undefined || epoch < state.sent) return false
@@ -599,8 +665,9 @@ export async function waitForBundledDevSettled(opts?: {
           }
         }
         // re-check: a reload decision may have landed while probing the page
-        return state.decided === state.sent
-      } catch {
+        return state.owedHmr + state.owedScheduled === 0
+      } catch (e) {
+        if (e instanceof SettleHarnessError) throw e
         // transient server-side errors (e.g. engine closing) — keep polling
         return false
       }
