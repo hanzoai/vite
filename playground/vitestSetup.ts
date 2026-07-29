@@ -711,7 +711,9 @@ afterEach(async (ctx) => {
   }
   try {
     await waitForBundledDevSettled({ timeout: 10_000 })
-  } catch {
+  } catch (e) {
+    // a broken harness must fail the run, not degrade into warnings
+    if (e instanceof SettleHarnessError) throw e
     console.warn(
       `[bundled-dev settle guard] "${ctx.task.name}" did not settle within 10s — later tests may see its trailing updates`,
     )
