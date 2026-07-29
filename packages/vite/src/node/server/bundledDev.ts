@@ -254,7 +254,9 @@ export class BundledDev {
       debug?.(`TRIGGER: access after HMR-stage failure, forcing full rebuild`)
 
       this.devEngine.triggerFullBuild()
-      this.scheduleReloadAfterBuild()
+      this.devEngine.ensureLatestBuildOutput().then(() => {
+        this.debouncedFullReload()
+      })
       return true
     }
 
@@ -263,16 +265,12 @@ export class BundledDev {
       !bundleState.lastBuildErrored &&
       this.initialBuildCompleted
     if (shouldTrigger) {
-      this.scheduleReloadAfterBuild()
+      this.devEngine.ensureLatestBuildOutput().then(() => {
+        this.debouncedFullReload()
+      })
       debug?.(`TRIGGER: access to stale bundle, triggered bundle re-generation`)
     }
     return shouldTrigger
-  }
-
-  private scheduleReloadAfterBuild(): void {
-    this.devEngine.ensureLatestBuildOutput().then(() => {
-      this.debouncedFullReload()
-    })
   }
 
   async triggerLazyBundling(

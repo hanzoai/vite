@@ -417,8 +417,8 @@ function bundledDevSettle(): PluginOption {
       if (typeof proto.handleHmrOutput !== 'function') {
         throw missing('BundledDev.prototype.handleHmrOutput')
       }
-      if (typeof proto.scheduleReloadAfterBuild !== 'function') {
-        throw missing('BundledDev.prototype.scheduleReloadAfterBuild')
+      if (typeof proto.triggerBundleRegenerationIfStale !== 'function') {
+        throw missing('BundledDev.prototype.triggerBundleRegenerationIfStale')
       }
       const hot = clientEnv.hot as any
       if (typeof hot?.send !== 'function' || typeof hot?.on !== 'function') {
@@ -449,10 +449,14 @@ function bundledDevSettle(): PluginOption {
           }
           return origHandleHmrOutput.call(this, client, files, hmrOutput)
         }
-        const origScheduleReload = proto.scheduleReloadAfterBuild
-        proto.scheduleReloadAfterBuild = function () {
-          if (settleState) settleState.decided++
-          return origScheduleReload.call(this)
+        // a `true` return means a fallback was served and a reload was
+        // scheduled for build completion (covers both the stale-output and
+        // the HMR-failure recovery branches)
+        const origTriggerRegen = proto.triggerBundleRegenerationIfStale
+        proto.triggerBundleRegenerationIfStale = async function () {
+          const scheduled = await origTriggerRegen.call(this)
+          if (settleState && scheduled) settleState.decided++
+          return scheduled
         }
       }
 
