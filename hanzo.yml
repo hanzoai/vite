@@ -8,4 +8,6 @@ test:
   - name: build
     run: |
       set -e
-      corepack enable\n      pnpm install --frozen-lockfile\n      pnpm typecheck
+      corepack enable
+      pnpm install --frozen-lockfile
+      pnpm typecheck
